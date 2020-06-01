@@ -66,7 +66,9 @@ class Simulacra:
                  infect_history, infect_init,
                  loss_func=losses.log_mean_square_loss,
                  quarantine_loss=0.001,
+                 hist_policy_limit=365,
                  n_states=5,
+                 reverse_order_policy=False,
                  n_simulation_repeat=8,
                  n_threads=1):
         """
@@ -87,6 +89,7 @@ class Simulacra:
         self.quarantine_loss = quarantine_loss
         self.n_states = n_states
         self.n_cells = self.city_pop.shape[0]
+        self.reverse_order_policy = reverse_order_policy
         
         # A (n_cities, n_provinces) map
         self.city_province_matrix = to_categorical(self.city_province_map, self.n_provinces)
@@ -94,7 +97,7 @@ class Simulacra:
         self.infect_history = infect_history
         self.infect_init = infect_init
         self.hist_test_limit = self.infect_history.shape[0]
-        self.hist_policy_limit = 720
+        self.hist_policy_limit = hist_policy_limit
         
         self.n_simulation_repeat = 8
         self.n_threads = n_threads
@@ -157,6 +160,7 @@ class Simulacra:
         verbose = policy.get('verbose', False)
         
         #kwargs = {**self.preset_params, **policy}
+        self.reset_policy_vector()
         self.set_policy(policy)
         hist, y_pred, in_quarantine = self.evaluate(self.policy_initial_pop,
                                                     HIST_POLICY_BEGIN, self.hist_policy_limit,
@@ -194,9 +198,11 @@ class Simulacra:
         self.policy_initial_pop = pop
         
     def set_policy(self, policy):
-        self.quarantine_thresh = N.power(10, policy['thresh'])
-        self.quarantine_thresh_power = policy['thresh_p']
-        self.quarantine_thresh_t = N.power(10, policy['thresh_t'])
+        #self.quarantine_thresh = N.power(10, policy['thresh'])
+        #self.quarantine_thresh_power = policy['thresh_p']
+        #self.quarantine_thresh_t = N.power(10, policy['thresh_t'])
+        self.q_end_date = policy['q_end_date']
+        self.q_power = N.power(10, policy['q_power'])
     
     def gleam_diagnostic(self, t, pop, policy):
         """
@@ -226,24 +232,30 @@ class Simulacra:
         Return a boolean vector. true => quarantine, false => no quarantine
         """
         if t < HIST_QUARANTINE_START:
-            return N.zeros((pop.shape[1],), dtype='bool')
+            return N.zeros((self.n_cells,), dtype='bool')
         
         if t <= HIST_POLICY_BEGIN:
-            return N.ones((pop.shape[1],), dtype='bool')
+            return N.ones((self.n_cells,), dtype='bool')
         
-        pop_bycity = pop.sum(axis=0)
-        pop_active = pop[[I_SYMPT,I_ASYMPT],:].sum(axis=0)
-        pop_total = pop_bycity.sum()
+        li = N.array(range(self.n_cells)) / (self.n_cells - 1)
+        if not self.reverse_order_policy:
+            li = N.flip(li, axis=0)
+        t = (t - HIST_POLICY_BEGIN) / self.q_end_date
+        return li >= N.power(t, self.q_power)
+    
+        #pop_bycity = pop.sum(axis=0)
+        #pop_active = pop[[I_SYMPT,I_ASYMPT],:].sum(axis=0)
+        #pop_total = pop_bycity.sum()
         
-        assert pop_bycity.shape == (pop.shape[1],)
-        assert pop_active.shape == (pop.shape[1],)
+        #assert pop_bycity.shape == (pop.shape[1],)
+        #assert pop_active.shape == (pop.shape[1],)
         
-        limits = pop_bycity * self.quarantine_thresh \
-            * N.power(1 - pop_bycity/pop_total, self.quarantine_thresh_power) \
-            * N.power(1 + self.quarantine_thresh_t, t)
-        assert pop_bycity.shape == limits.shape
-        self.policy_enabled  = (pop_active > limits) & self.policy_enabled
-        return self.policy_enabled
+        #limits = pop_bycity * self.quarantine_thresh \
+        #    * N.power(1 - pop_bycity/pop_total, self.quarantine_thresh_power) \
+        #    * N.power(1 + self.quarantine_thresh_t, t)
+        #assert pop_bycity.shape == limits.shape
+        #self.policy_enabled  = (pop_active > limits) & self.policy_enabled
+        #return self.policy_enabled
         
                          
     
