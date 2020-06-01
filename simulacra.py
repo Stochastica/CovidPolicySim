@@ -46,11 +46,13 @@ DEFAULT_PARAMETER = {
 DEFAULT_POLICY = {
     # A city should open when
     #
-    # infected_pop <= city_pop * thresh * (1 - city_pop/total_pop)^thresh_p
+    # infected_pop <= city_pop * thresh * (1 - city_pop/total_pop)^thresh_p * (1+thresh_t)^days
     
     # (log), thresh
-    'quarantine_thresh': -1.0,
-    'quarantine_thresh_p': 0.1,
+    'thresh': -7.0,
+    'thresh_p': 0.1,
+    # (log) thresh_t
+    'thresh_t': 0.0,
 }
 
 def to_categorical(x, n_categories):
@@ -65,7 +67,8 @@ class Simulacra:
                  loss_func=losses.log_mean_square_loss,
                  quarantine_loss=0.001,
                  n_states=5,
-                 n_simulation_repeat=8):
+                 n_simulation_repeat=8,
+                 n_threads=1):
         """
         city_dist_matrix: unit:distance
         city_province_map: 1d array mapping cities to provinces
@@ -91,11 +94,12 @@ class Simulacra:
         self.infect_history = infect_history
         self.infect_init = infect_init
         self.hist_test_limit = self.infect_history.shape[0]
-        self.hist_policy_limit = 365
+        self.hist_policy_limit = 720
         
         self.n_simulation_repeat = 8
+        self.n_threads = n_threads
     
-    def evaluate(self, n_timesteps, **kwargs):
+    def evaluate(self, pop, initial_time, n_timesteps, **kwargs):
         
         verbose = kwargs.get('verbose', False)
         
@@ -107,19 +111,20 @@ class Simulacra:
         mobility_q = mobility * N.power(10, kwargs['mobility_reduct'])
         mobility_pop = N.power(10, kwargs['mobility_pop'])
         
-        latent_ratio = N.power(10, kwargs['latent_ratio'])
         
         pressure_func = self.create_pressure_func(infectiosity, infectiosity_q)
         transfer_func = self.create_transfer_func(mobility, mobility_q, mobility_pop)
 
-        pop = self.create_initial_pop(latent_ratio)
+        diag_func = kwargs.get('diag_func', self.gleam_diagnostic)
+        
         #print("Initial pop: {}".format(N.sum(pop, axis=1)))
         
-        self.model = gleam.Gleam(pop, transfer_func, pressure_func)
+        self.model = gleam.Gleam(pop, transfer_func, pressure_func, n_threads=self.n_threads)
+        self.reset_policy_vector()
         hist,diags = self.model.simulate(n_timesteps,
-                                    state_diag_func=self.gleam_diagnostic, 
+                                    state_diag_func=diag_func, 
                                     policy_func=self.gleam_policy,
-                                    initial_timestep=HIST_TRAIN_BEGIN,
+                                    initial_timestep=initial_time,
                                     verbose=verbose)
         
         y_pred, in_quarantine = zip(*diags)
@@ -132,8 +137,12 @@ class Simulacra:
         
         #kwargs = {**params, **DEFAULT_POLICY}
         self.set_policy(DEFAULT_POLICY)
+        
+        latent_ratio = N.power(10, params['latent_ratio'])
+        pop = self.create_initial_pop(latent_ratio)
         y_true = self.infect_history[:,HIST_TRAIN_BEGIN:HIST_TRAIN_LIMIT]
-        hist, y_pred, _ = self.evaluate(HIST_TRAIN_LIMIT, **params)
+        
+        hist, y_pred, _ = self.evaluate(pop, HIST_TRAIN_BEGIN, HIST_TRAIN_LIMIT, **params)
         #y_pred = y_pred[:,1:]
         #print("y_true: {}, y_pred: {}".format(y_true.shape, y_pred.shape))
         
@@ -145,25 +154,49 @@ class Simulacra:
         if self.preset_params is None:
             raise RuntimError("Parameters are not initialised")
         
+        verbose = policy.get('verbose', False)
+        
         #kwargs = {**self.preset_params, **policy}
         self.set_policy(policy)
-        hist, y_pred, in_quarantine = self.evaluate(self.hist_policy_limit, **self.preset_params)
+        hist, y_pred, in_quarantine = self.evaluate(self.policy_initial_pop,
+                                                    HIST_POLICY_BEGIN, self.hist_policy_limit,
+                                                    **self.preset_params, verbose=verbose)
         
-        index_shift = HIST_POLICY_BEGIN - HIST_TRAIN_BEGIN
-        y_pred = y_pred[[I_SYMPT,I_ASYMPT],1+index_shift:].sum(axis=0)
-        in_quarantine = in_quarantine[index_shift:]
+        if verbose:
+            print("y_pred={}, in_quarantine={}".format(y_pred.shape, in_quarantine.shape))
+            
+        hist = N.array(hist).T[1:,:]
+        if False:
+            # Compute healthcare system pressure
+            infected_hist = hist[[I_SYMPT,I_ASYMPT],1:].sum(axis=0)
+
+            assert in_quarantine.shape == (infected_hist.shape[0],)
+
+            loss1 = infected_hist.max()
+        else:
+            # Compute total cases
+            loss1 = hist[[I_LATENT, I_SYMPT, I_ASYMPT, I_RECOV],-1].sum()
+            
+        loss2 = in_quarantine.sum()
+        if verbose:
+            print("loss1={}, loss2={}".format(loss1, loss2))
+            print("scale={}".format(loss2 / loss1))
         
-        assert in_quarantine.shape == (y_pred.shape[1],)
-        
-        return -(y_pred.max() + self.quarantine_loss * in_quarantine.sum())
+        total_pop = hist[:,-1].sum()
+        return -(loss1/total_pop + self.quarantine_loss*loss2/total_pop)
+        #return -N.log10(loss1) - N.log10(loss2)
+        #return -N.log10(loss1 + self.quarantine_loss * loss2)
         
     
     
-    def set_params(self, p):
+    def set_params(self, p, pop):
         self.preset_params = p
+        self.policy_initial_pop = pop
+        
     def set_policy(self, policy):
-        self.quarantine_thresh = N.power(10, policy['quarantine_thresh'])
-        self.quarantine_thresh_power = policy['quarantine_thresh_p']
+        self.quarantine_thresh = N.power(10, policy['thresh'])
+        self.quarantine_thresh_power = policy['thresh_p']
+        self.quarantine_thresh_t = N.power(10, policy['thresh_t'])
     
     def gleam_diagnostic(self, t, pop, policy):
         """
@@ -179,6 +212,13 @@ class Simulacra:
         
         return pop_active, pop_quarantined
     
+    def gleam_identity_diagnostic(self, t, pop, policy):
+        pop_quarantined = pop.sum(axis=0).dot(policy)
+        return pop, pop_quarantined
+    
+    def reset_policy_vector(self):
+        self.policy_enabled = N.ones((self.city_pop.shape[0],), dtype='bool')
+        
     def gleam_policy(self, t, pop):
         """
         pop: entire population
@@ -198,9 +238,12 @@ class Simulacra:
         assert pop_bycity.shape == (pop.shape[1],)
         assert pop_active.shape == (pop.shape[1],)
         
-        limits = pop_bycity * self.quarantine_thresh * N.power(1 - pop_bycity/pop_total, self.quarantine_thresh_power)
+        limits = pop_bycity * self.quarantine_thresh \
+            * N.power(1 - pop_bycity/pop_total, self.quarantine_thresh_power) \
+            * N.power(1 + self.quarantine_thresh_t, t)
         assert pop_bycity.shape == limits.shape
-        return pop_active > limits
+        self.policy_enabled  = (pop_active > limits) & self.policy_enabled
+        return self.policy_enabled
         
                          
     
@@ -223,10 +266,10 @@ class Simulacra:
         assert 0 <= infectiosity_q and infectiosity_q <= 1
         
         def f(t, i, s, policy):
-            # ignore t,i
 
-            incubation = 1/5
-            recovery = 1/14
+            incubation = 1/10
+            recovery_mild = 1/20 #1/14
+            recovery_severe = 1/30
 
             total = N.sum(s)
             if N.sum(s) == 0:
@@ -245,10 +288,10 @@ class Simulacra:
             p[I_LATENT,I_SYMPT] = incubation * 0.2
             p[I_LATENT,I_ASYMPT] = incubation * 0.8
 
-            p[I_SYMPT, I_SYMPT] = 1 - recovery
-            p[I_SYMPT, I_RECOV] = recovery
-            p[I_ASYMPT, I_ASYMPT] = 1 - recovery
-            p[I_ASYMPT, I_RECOV] = recovery
+            p[I_SYMPT, I_SYMPT] = 1 - recovery_severe
+            p[I_SYMPT, I_RECOV] = recovery_severe
+            p[I_ASYMPT, I_ASYMPT] = 1 - recovery_mild
+            p[I_ASYMPT, I_RECOV] = recovery_mild
             p[I_RECOV, I_RECOV] = 1
 
             return p
